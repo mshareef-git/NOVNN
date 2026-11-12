@@ -1,0 +1,719 @@
+import { check, suite } from './harness';
+
+import { buildSessionMetrics } from '../src/exercise/metrics';
+import {
+  createSessionId,
+  createSessionRecord,
+  createSessionStore,
+  dayLabel,
+  MAX_SAVED_SESSIONS,
+  parseSessionHistory,
+  parseSessionHistoryResult,
+  parseSessionRecord,
+  SESSION_HISTORY_KEY,
+  type KeyValueStore,
+  type SessionRecord,
+} from '../src/exercise/session-store';
+
+// Reading the history component's source is how the user-visible wording is
+// checked, matching how result-routing.test.ts guards the Result screen. The
+// minimal declarations are declared here rather than pulling in @types/node.
+declare const __dirname: string;
+declare function require(id: string): {
+  readFileSync(path: string, encoding: 'utf8'): string;
+  resolve(...segments: string[]): string;
+};
+
+/**
+ * A `KeyValueStore` with no device behind it.
+ *
+ * Backed by a plain object, so it can also be PRE-SEEDED with whatever garbage
+ * a previous version, a crash mid-write, or a curious user left behind — which
+ * is how the malformed-data cases are exercised.
+ *
+ * `throwing` makes every operation reject, so the "storage is unavailable"
+ * degradation path is testable too.
+ *
+ * `failReads` is separate from `throwing` because the two are different
+ * situations. `throwing` models storage that is simply not there: every call
+ * fails, so nothing is ever overwritten. `failReads` models reads that do not come
+ * back while writing still works — the only case in which a store that treats a
+ * failed read as "empty" can go on to destroy sessions that really are stored. It
+ * has to be expressible on its own to be tested.
+ */
+function fakeStore(
+  seed: Record<string, string> = {},
+  throwing = false,
+  failReads = 0,
+): KeyValueStore & {
+  data: Record<string, string>;
+  writes: number;
+  reads: number;
+} {
+  const data: Record<string, string> = { ...seed };
+  const self = {
+    data,
+    writes: 0,
+    reads: 0,
+    getItem(key: string): Promise<string | null> {
+      self.reads += 1;
+      if (throwing || self.reads <= failReads) {
+        return Promise.reject(new Error('storage unavailable'));
+      }
+      return Promise.resolve(key in data ? data[key] : null);
+    },
+    setItem(key: string, value: string): Promise<void> {
+      if (throwing) return Promise.reject(new Error('storage unavailable'));
+      self.writes += 1;
+      data[key] = value;
+      return Promise.resolve();
+    },
+    removeItem(key: string): Promise<void> {
+      if (throwing) return Promise.reject(new Error('storage unavailable'));
+      delete data[key];
+      return Promise.resolve();
+    },
+  };
+  return self;
+}
+
+/** A finished session's metrics, as `end()` would build them. */
+function metrics(overrides: Partial<ReturnType<typeof buildSessionMetrics>> = {}) {
+  return {
+    ...buildSessionMetrics({
+      reps: 5,
+      durationSeconds: 154,
+      repRanges: [82, 80, 79],
+      rangeMinDeg: 88,
+      rangeMaxDeg: 170,
+    }),
+    ...overrides,
+  };
+}
+
+function record(id: string, completedAt: string, overrides: Partial<SessionRecord> = {}): SessionRecord {
+  return {
+    ...createSessionRecord({
+      id,
+      exerciseId: 'seated-knee-extension',
+      exerciseName: 'Seated Knee Extension',
+      completedAt,
+      metrics: metrics(),
+    }),
+    ...overrides,
+  };
+}
+
+export function run(): void {
+  suite('session history: a saved session comes back exactly as it was saved', async () => {
+    const store = createSessionStore(fakeStore());
+    const saved = record('a1', '2026-09-27T09:00:00.000Z', {
+      reps: 5,
+      durationSeconds: 154,
+      paceRpm: 1.9,
+      rangeMinDeg: 88,
+      rangeMaxDeg: 170,
+      consistencyPct: 99,
+    });
+
+    await store.saveSession(saved);
+    const all = await store.getSessions();
+
+    check('exactly one session is stored', all.length === 1, all.length);
+    check('it is the record that was saved', all[0].id === 'a1', all[0]);
+    check('reps survive the round trip', all[0].reps === 5, all[0].reps);
+    check('duration survives the round trip', all[0].durationSeconds === 154, all[0].durationSeconds);
+    check('pace survives the round trip', all[0].paceRpm === 1.9, all[0].paceRpm);
+    check('range survives the round trip', all[0].rangeMinDeg === 88 && all[0].rangeMaxDeg === 170, all[0]);
+    check('consistency survives the round trip', all[0].consistencyPct === 99, all[0].consistencyPct);
+    check('the exercise name is kept', all[0].exerciseName === 'Seated Knee Extension', all[0].exerciseName);
+
+    const byId = await store.getSessionById('a1');
+    check('it is retrievable by id', byId !== null && byId.id === 'a1', byId);
+    check('an unknown id returns null', (await store.getSessionById('nope')) === null);
+  });
+
+  suite('session history: multiple sessions are preserved, newest first', async () => {
+    const store = createSessionStore(fakeStore());
+    await store.saveSession(record('old', '2026-09-25T08:00:00.000Z'));
+    await store.saveSession(record('newest', '2026-09-27T19:00:00.000Z'));
+    await store.saveSession(record('middle', '2026-09-26T08:00:00.000Z'));
+
+    const all = await store.getSessions();
+    check('all three sessions survive', all.length === 3, all.map((r) => r.id));
+    check('newest comes first', all[0].id === 'newest', all.map((r) => r.id));
+    check('then the middle one', all[1].id === 'middle', all.map((r) => r.id));
+    check('oldest comes last', all[2].id === 'old', all.map((r) => r.id));
+  });
+
+  suite('session history: newest-first order holds regardless of insertion order', () => {
+    const shuffled = [
+      record('b', '2026-09-26T10:00:00.000Z'),
+      record('a', '2026-09-25T10:00:00.000Z'),
+      record('c', '2026-09-27T10:00:00.000Z'),
+    ];
+    const sorted = parseSessionHistory(JSON.stringify(shuffled));
+    check('sorted by completedAt, descending', sorted.map((r) => r.id).join(',') === 'c,b,a', sorted.map((r) => r.id));
+  });
+
+  suite('session history: the same completed session is saved only once', async () => {
+    const store = createSessionStore(fakeStore());
+    const completed = record('same', '2026-09-27T10:00:00.000Z');
+
+    // Saving the identical completed session repeatedly must not inflate the
+    // history. This is the storage-level half of the once-only guarantee; the
+    // other half is the terminal guard on the session screen's End handler.
+    await store.saveSession(completed);
+    await store.saveSession(completed);
+    await store.saveSession(completed);
+
+    const all = await store.getSessions();
+    check('three saves produce one session', all.length === 1, all.map((r) => r.id));
+    check('and the record is unchanged', all[0].reps === completed.reps && all[0].durationSeconds === completed.durationSeconds, all[0]);
+  });
+
+  suite('session history: deleting removes only the requested session', async () => {
+    const store = createSessionStore(fakeStore());
+    await store.saveSession(record('a', '2026-09-26T10:00:00.000Z'));
+    await store.saveSession(record('b', '2026-09-27T10:00:00.000Z'));
+
+    check('deleting a stored id reports success', (await store.deleteSession('a')) === true);
+    const afterDelete = await store.getSessions();
+    check('only the other session remains', afterDelete.length === 1 && afterDelete[0].id === 'b', afterDelete.map((r) => r.id));
+    check('deleting an unknown id reports false', (await store.deleteSession('missing')) === false);
+
+    await store.clearSessions();
+    check('clearSessions empties the history', (await store.getSessions()).length === 0);
+  });
+
+  suite('session history: a zero-rep session is recorded honestly', async () => {
+    const store = createSessionStore(fakeStore());
+    // A session the user ended without completing a rep is still a session they
+    // finished, so it is kept — and it must not be dressed up with a score.
+    const zero = createSessionRecord({
+      id: 'zero',
+      exerciseId: 'seated-knee-extension',
+      exerciseName: 'Seated Knee Extension',
+      completedAt: '2026-09-27T10:00:00.000Z',
+      metrics: metrics({
+        reps: 0,
+        durationSeconds: 0,
+        paceRpm: null,
+        rangeMinDeg: null,
+        rangeMaxDeg: null,
+        consistencyPct: null,
+      }),
+    });
+
+    await store.saveSession(zero);
+    const [stored] = await store.getSessions();
+
+    check('the zero-rep session is kept', stored !== undefined, stored);
+    check('reps stay zero', stored.reps === 0, stored.reps);
+    check('duration stays zero', stored.durationSeconds === 0, stored.durationSeconds);
+    check('an unmeasured pace stays null', stored.paceRpm === null, stored.paceRpm);
+    check('an unmeasured range stays null', stored.rangeMinDeg === null && stored.rangeMaxDeg === null, stored);
+    check('unmeasured consistency stays null', stored.consistencyPct === null, stored.consistencyPct);
+    check('no score field is invented', !('score' in stored), Object.keys(stored));
+  });
+
+  suite('session history: optional metrics stay null rather than becoming fake values', async () => {
+    const store = createSessionStore(fakeStore());
+    // A 4-second session cannot produce a pace, and a single rep cannot produce
+    // a consistency. Both must round-trip as null, not as 0.
+    const thin = createSessionRecord({
+      id: 'thin',
+      exerciseId: 'seated-knee-extension',
+      exerciseName: 'Seated Knee Extension',
+      completedAt: '2026-09-27T10:00:00.000Z',
+      metrics: metrics({ reps: 1, durationSeconds: 4, paceRpm: null, consistencyPct: null }),
+    });
+
+    await store.saveSession(thin);
+    const [stored] = await store.getSessions();
+    check('pace survives as null', stored.paceRpm === null, stored.paceRpm);
+    check('consistency survives as null', stored.consistencyPct === null, stored.consistencyPct);
+    check('a real range is still kept', stored.rangeMaxDeg === 170, stored.rangeMaxDeg);
+  });
+
+  suite('session history: malformed stored data does not crash the app', async () => {
+    // Every one of these is something a crash mid-write, a downgrade, or a
+    // hand-edited value could leave in storage. None may throw, and none may
+    // invent a number.
+    const hostile: unknown[] = [
+      undefined,
+      null,
+      '',
+      'not json at all',
+      '{"broken":',
+      '"a bare string"',
+      '42',
+      '{}',
+      '[]',
+      [null, 1, 'x'],
+      [{}],
+      [{ id: '', exerciseId: 'e', exerciseName: 'E', completedAt: '2026-09-27T10:00:00.000Z', reps: 1, durationSeconds: 1 }],
+      [{ id: 'x', exerciseId: 'e', exerciseName: 'E', completedAt: 'yesterday', reps: 1, durationSeconds: 1 }],
+      [{ id: 'x', exerciseId: 'e', exerciseName: 'E', completedAt: '2026-09-27T10:00:00.000Z', reps: 5.7, durationSeconds: 1 }],
+      [{ id: 'x', exerciseId: 'e', exerciseName: 'E', completedAt: '2026-09-27T10:00:00.000Z', reps: -3, durationSeconds: 1 }],
+      [{ id: 'x', exerciseId: 'e', exerciseName: 'E', completedAt: '2026-09-27T10:00:00.000Z', reps: 1, durationSeconds: -10 }],
+      [
+        {
+          id: 'x',
+          exerciseId: 'e',
+          exerciseName: 'E',
+          completedAt: '2026-09-27T10:00:00.000Z',
+          reps: 1,
+          durationSeconds: 10,
+          paceRpm: 'fast',
+        },
+      ],
+      [
+        {
+          id: 'x',
+          exerciseId: 'e',
+          exerciseName: 'E',
+          completedAt: '2026-09-27T10:00:00.000Z',
+          reps: 1,
+          durationSeconds: 10,
+          consistencyPct: 900,
+        },
+      ],
+    ];
+
+    for (const [index, value] of hostile.entries()) {
+      let threw: unknown = null;
+      let parsed: SessionRecord[] | null = null;
+      try {
+        parsed = parseSessionHistory(typeof value === 'string' ? value : JSON.stringify(value));
+      } catch (error) {
+        threw = error;
+      }
+      check(`hostile input #${index} does not throw`, threw === null, threw === null ? null : String(threw));
+      check(`hostile input #${index} yields no records`, parsed !== null && parsed.length === 0, parsed);
+    }
+
+    // NaN and Infinity cannot survive JSON, so they are checked on the record
+    // parser directly, where hand-built objects can carry them.
+    check('NaN pace is rejected', parseSessionRecord({ ...record('a', '2026-09-27T10:00:00.000Z'), paceRpm: Number.NaN }) === null);
+    check('Infinity pace is rejected', parseSessionRecord({ ...record('a', '2026-09-27T10:00:00.000Z'), paceRpm: Infinity }) === null);
+    check('NaN reps is rejected', parseSessionRecord({ ...record('a', '2026-09-27T10:00:00.000Z'), reps: Number.NaN }) === null);
+    check('an id that is not a string is rejected', parseSessionRecord({ ...record('a', '2026-09-27T10:00:00.000Z'), id: 7 }) === null);
+  });
+
+  suite('session history: a corrupt entry is reported while good records survive', async () => {
+    const good = record('good', '2026-09-27T10:00:00.000Z');
+    const alsoGood = record('also-good', '2026-09-26T10:00:00.000Z');
+    // One unreadable record sitting between two valid ones.
+    const seed = JSON.stringify([good, { id: 'broken' }, alsoGood]);
+    const backing = fakeStore({ [SESSION_HISTORY_KEY]: seed });
+    const store = createSessionStore(backing);
+
+    const result = await store.getSessionsResult();
+    check('the read is marked partial rather than empty or fully successful', result.status === 'partial');
+    if (result.status === 'error') return;
+    const all = result.records;
+    check('the valid sessions are still readable', all.length === 2, all.map((r) => r.id));
+    check('and still ordered newest first', all[0].id === 'good', all.map((r) => r.id));
+    check('the issue identifies malformed stored entries', result.status === 'partial' && result.issue.kind === 'malformed');
+
+    let refused = false;
+    try {
+      await store.saveSession(record('new', '2026-09-28T10:00:00.000Z'));
+    } catch {
+      refused = true;
+    }
+    check('a later save refuses to overwrite partially unreadable history', refused);
+    check('the original malformed blob is left unchanged', backing.data[SESSION_HISTORY_KEY] === seed);
+    check('no write was attempted', backing.writes === 0, backing.writes);
+  });
+
+  suite('session history load result: populated and genuinely empty reads are distinct successes', async () => {
+    const saved = record('saved', '2026-09-27T10:00:00.000Z');
+    const populated = await createSessionStore(
+      fakeStore({ [SESSION_HISTORY_KEY]: JSON.stringify([saved]) }),
+    ).getSessionsResult();
+    check(
+      'a valid stored session is a successful populated load',
+      populated.status === 'loaded' && populated.records.length === 1 && populated.records[0].id === 'saved',
+      populated,
+    );
+
+    const empty = await createSessionStore(fakeStore()).getSessionsResult();
+    check('a missing history key is a successful empty load', empty.status === 'loaded' && empty.records.length === 0, empty);
+    const emptyArray = parseSessionHistoryResult('[]');
+    check('an explicit empty array is also a successful empty load',
+      emptyArray.status === 'loaded' && emptyArray.records.length === 0);
+  });
+
+  suite('session history load result: storage failures remain errors and retry', async () => {
+    const saved = record('kept', '2026-09-27T10:00:00.000Z');
+    const seed = JSON.stringify([saved]);
+    const backing = fakeStore({ [SESSION_HISTORY_KEY]: seed }, false, 1);
+    const store = createSessionStore(backing);
+
+    const first = await store.getSessionsResult();
+    check('a failed read is not reported as a successful empty history',
+      first.status === 'error' && first.issue.kind === 'storage', first);
+    check('the failed attempt does not rewrite storage', backing.data[SESSION_HISTORY_KEY] === seed && backing.writes === 0);
+
+    const retry = await store.getSessionsResult();
+    check('retry succeeds when storage recovers',
+      retry.status === 'loaded' && retry.records.length === 1 && retry.records[0].id === 'kept', retry);
+    check('retry reads the device again instead of caching the failure', backing.reads === 2, backing.reads);
+  });
+
+  suite('session history load result: malformed top-level data is not empty and cannot be overwritten', async () => {
+    const seed = '{"broken":';
+    const backing = fakeStore({ [SESSION_HISTORY_KEY]: seed });
+    const store = createSessionStore(backing);
+
+    const result = await store.getSessionsResult();
+    check('malformed JSON is reported as a malformed-data error',
+      result.status === 'error' && result.issue.kind === 'malformed', result);
+    check('the legacy parser remains non-throwing and returns no usable records',
+      parseSessionHistory(seed).length === 0);
+
+    let refused = false;
+    try {
+      await store.saveSession(record('new', '2026-09-28T10:00:00.000Z'));
+    } catch {
+      refused = true;
+    }
+    check('saving refuses to replace malformed stored data', refused);
+    check('the original malformed bytes remain untouched', backing.data[SESSION_HISTORY_KEY] === seed);
+    check('the failed save performs no storage write', backing.writes === 0, backing.writes);
+
+    const malformedRecords = await createSessionStore(
+      fakeStore({ [SESSION_HISTORY_KEY]: JSON.stringify([{ id: 'invalid-only' }]) }),
+    ).getSessionsResult();
+    check('a valid JSON array with no valid session records is still reported as malformed',
+      malformedRecords.status === 'error' && malformedRecords.issue.kind === 'malformed', malformedRecords);
+  });
+
+  suite('session history: unreadable storage degrades to an empty history', async () => {
+    const store = createSessionStore(fakeStore({}, true));
+    check('a failing read yields no sessions', (await store.getSessions()).length === 0);
+
+    // A save that cannot be stored must not leave the in-memory view claiming a
+    // session that was never written. In this store every operation fails, so the
+    // save is refused before anything reaches the key, and the guarantee the
+    // caller relies on holds either way: the promise rejects and nothing lands.
+    let rejected = false;
+    try {
+      await store.saveSession(record('x', '2026-09-27T10:00:00.000Z'));
+    } catch {
+      rejected = true;
+    }
+    check('a failing write surfaces its error to the caller', rejected, rejected);
+    check('and stores nothing', (await store.getSessions()).length === 0);
+  });
+
+  suite('session history: a failed read cannot let a later save destroy stored history', async () => {
+    // Pre-seeded rather than written through the store, so what was "already on
+    // the device" is unambiguous. `failReads` is 2 so that both the priming read
+    // and the read inside `saveSession` fail: that is the destructive case, where
+    // a store that treats a failed read as "empty" merges into nothing and writes
+    // a one-session history over the top of the real one.
+    const oldest = record('r1', '2026-09-25T08:00:00.000Z');
+    const middle = record('r2', '2026-09-26T08:00:00.000Z');
+    const newest = record('r3', '2026-09-27T08:00:00.000Z');
+    const seed = JSON.stringify([newest, middle, oldest]);
+    const backing = fakeStore({ [SESSION_HISTORY_KEY]: seed }, false, 2);
+    const store = createSessionStore(backing);
+
+    // The read that fails is still reported as an empty list, because a list that
+    // could not be loaded has to keep rendering.
+    check('the failed read reports no sessions', (await store.getSessions()).length === 0);
+
+    let rejected = false;
+    try {
+      await store.saveSession(record('new', '2026-09-28T08:00:00.000Z'));
+    } catch {
+      rejected = true;
+    }
+    check('saving after a failed read refuses rather than writing', rejected, rejected);
+
+    // The whole point: what was already stored is still there.
+    check(
+      'the stored history is byte-for-byte untouched',
+      backing.data[SESSION_HISTORY_KEY] === seed,
+      backing.data[SESSION_HISTORY_KEY],
+    );
+    check('nothing was written to the key', backing.writes === 0, backing.writes);
+
+    // Intact in memory would be worthless; it has to survive a restart, because a
+    // refused save is only recoverable if the next launch can still read it.
+    const afterRestart = createSessionStore(backing);
+    const all = await afterRestart.getSessions();
+    check('a fresh store still reads all three original sessions', all.length === 3, all.map((r) => r.id));
+    check('newest first, unchanged', all.map((r) => r.id).join(',') === 'r3,r2,r1', all.map((r) => r.id));
+  });
+
+  suite('session history: a failed read is retried instead of cached as empty', async () => {
+    // One store instance lives for the whole process, so caching a failed read as
+    // "empty" would report an empty history to every screen until the app was
+    // restarted - long after the storage recovered.
+    const kept = record('kept', '2026-09-27T08:00:00.000Z');
+    const backing = fakeStore({ [SESSION_HISTORY_KEY]: JSON.stringify([kept]) }, false, 1);
+    const store = createSessionStore(backing);
+
+    check('the first read fails and reports nothing', (await store.getSessions()).length === 0);
+    check('and it did reach the storage', backing.reads === 1, backing.reads);
+
+    const retried = await store.getSessions();
+    check('the next read retries and finds the stored session', retried.length === 1, retried.map((r) => r.id));
+    check('and it is the session that was really stored', retried[0]?.id === 'kept', retried[0]);
+    check('so the history was not hidden for the rest of the process', (await store.getSessions()).length === 1);
+    check('and the retry did not re-read once the cache was warm', backing.reads === 2, backing.reads);
+  });
+
+  suite('session history: saving works normally once a read has succeeded', async () => {
+    // The refusal must not stick. After one good read the store is back to
+    // normal, or a single storage hiccup would disable recording for the rest of
+    // the process.
+    const kept = record('kept', '2026-09-27T08:00:00.000Z');
+    const backing = fakeStore({ [SESSION_HISTORY_KEY]: JSON.stringify([kept]) }, false, 1);
+    const store = createSessionStore(backing);
+
+    await store.getSessions();
+    await store.getSessions();
+
+    await store.saveSession(record('added', '2026-09-28T08:00:00.000Z'));
+    const all = await store.getSessions();
+    check('the new session is stored alongside the older one', all.length === 2, all.map((r) => r.id));
+    check('newest first', all[0].id === 'added', all.map((r) => r.id));
+    check('the earlier session was merged in, not replaced', all[1].id === 'kept', all.map((r) => r.id));
+    check('and it reached the key', backing.writes === 1, backing.writes);
+  });
+
+  suite('session history: deleting after a failed read does not destroy anything', async () => {
+    // Deletion must stay non-destructive too. `failReads` is 2 so the delete's own
+    // read fails as well and it genuinely has no list to work from.
+    const kept = record('kept', '2026-09-27T08:00:00.000Z');
+    const seed = JSON.stringify([kept]);
+    const backing = fakeStore({ [SESSION_HISTORY_KEY]: seed }, false, 2);
+    const store = createSessionStore(backing);
+
+    await store.getSessions();
+    check('deleting reports that nothing matched', (await store.deleteSession('kept')) === false);
+    check('the stored history is still intact', backing.data[SESSION_HISTORY_KEY] === seed, backing.data[SESSION_HISTORY_KEY]);
+    check('and nothing was written', backing.writes === 0, backing.writes);
+  });
+
+  suite('session history: clearing after a failed read leaves recording working', async () => {
+    // Clearing is the one operation that PROVES what is stored: the key is
+    // removed outright, so there is no unread history left that a write could
+    // destroy, and the refusal that protects an unreadable history has nothing
+    // left to protect.
+    //
+    // This is reachable, not theoretical. It needs a read to have failed first —
+    // a transient storage error, which is the very situation a user is most
+    // likely to clear their history in. Settings -> Privacy deletes for real.
+    const kept = record('kept', '2026-09-27T08:00:00.000Z');
+    const seed = JSON.stringify([kept]);
+    const backing = fakeStore({ [SESSION_HISTORY_KEY]: seed }, false, 1);
+    const store = createSessionStore(backing);
+
+    check('the first read fails and reports nothing', (await store.getSessions()).length === 0);
+
+    await store.clearSessions();
+    check('clearing removed the stored history', backing.data[SESSION_HISTORY_KEY] === undefined);
+
+    // Before the fix this rejected with "session history could not be read;
+    // refusing to overwrite it", and kept rejecting for the rest of the process.
+    let rejected: string | null = null;
+    try {
+      await store.saveSession(record('after-clear', '2026-09-28T08:00:00.000Z'));
+    } catch (error) {
+      rejected = error instanceof Error ? error.message : String(error);
+    }
+    check('a session finished after clearing is recorded', rejected === null, rejected);
+    check('it reached the key', backing.writes === 1, backing.writes);
+
+    const all = await store.getSessions();
+    check('and it comes back', all.length === 1, all.map((r) => r.id));
+    check('as the only session', all[0]?.id === 'after-clear', all.map((r) => r.id));
+
+    // Not merely in memory: a cleared-then-used store has to survive a restart,
+    // because a session recorded into a cache that never reached storage would
+    // look saved and then vanish.
+    const afterRestart = createSessionStore(backing);
+    const persisted = await afterRestart.getSessions();
+    check('it survives a restart', persisted.length === 1, persisted.map((r) => r.id));
+    check('with the same id', persisted[0]?.id === 'after-clear', persisted.map((r) => r.id));
+
+    // And clearing resets the flag because the key is gone, NOT because a read
+    // ever succeeded: the refusal that protects a genuinely unreadable history is
+    // untouched.
+    const guardedBacking = fakeStore({ [SESSION_HISTORY_KEY]: seed }, false, 2);
+    const guarded = createSessionStore(guardedBacking);
+    check('an unread history still reports nothing', (await guarded.getSessions()).length === 0);
+    check('and its bytes are still on the device', guardedBacking.data[SESSION_HISTORY_KEY] === seed);
+    check('nothing was written over them', guardedBacking.writes === 0, guardedBacking.writes);
+  });
+
+  suite('session history: sessions survive a restart of the app', async () => {
+    // The defining property of persistence: a brand new store instance over the
+    // same storage — which is exactly what an app launch produces — still sees
+    // the session. An in-memory-only store would fail this.
+    const backing = fakeStore();
+    const first = createSessionStore(backing);
+    await first.saveSession(record('persisted', '2026-09-27T10:00:00.000Z', { reps: 6 }));
+
+    const afterRestart = createSessionStore(backing);
+    const all = await afterRestart.getSessions();
+    check('a new store instance still sees the session', all.length === 1, all.length);
+    check('with its real rep count', all[0].reps === 6, all[0].reps);
+    check('and it lives under one single storage key', Object.keys(backing.data).join(',') === SESSION_HISTORY_KEY, Object.keys(backing.data));
+  });
+
+  suite('session history: the record is built from real session metrics', () => {
+    const built = createSessionRecord({
+      id: 'r',
+      exerciseId: 'seated-knee-extension',
+      exerciseName: 'Seated Knee Extension',
+      completedAt: '2026-09-27T10:00:00.000Z',
+      metrics: buildSessionMetrics({
+        reps: 3,
+        durationSeconds: 22,
+        repRanges: [80, 80, 80],
+        rangeMinDeg: 90,
+        rangeMaxDeg: 170,
+      }),
+    });
+
+    check('reps are carried over', built.reps === 3, built.reps);
+    check('a 22s session does produce a real pace', built.paceRpm !== null && built.paceRpm > 8 && built.paceRpm < 9, built.paceRpm);
+    check('identical reps give full consistency', built.consistencyPct === 100, built.consistencyPct);
+    check('the range is carried over', built.rangeMinDeg === 90 && built.rangeMaxDeg === 170, built);
+  });
+
+  suite('session history: ids are unique and sortable', () => {
+    const a = createSessionId(1_757_000_000_000, 0.5);
+    const b = createSessionId(1_757_000_000_000, 0.9);
+    check('two sessions in the same millisecond differ', a !== b, { a, b });
+    check('the id is not empty', a.length > 0, a);
+  });
+
+  suite('session history: the history cannot grow without bound', async () => {
+    const store = createSessionStore(fakeStore());
+    // One more than the cap, written oldest-first so the drop is observable.
+    for (let i = 0; i <= MAX_SAVED_SESSIONS; i += 1) {
+      const at = new Date(Date.UTC(2026, 0, 1) + i * 60_000).toISOString();
+      await store.saveSession(record(`s${i}`, at));
+    }
+    const all = await store.getSessions();
+    check('the stored history is capped', all.length === MAX_SAVED_SESSIONS, all.length);
+    check('the oldest sessions are the ones dropped', all[0].id === `s${MAX_SAVED_SESSIONS}`, all[0].id);
+  });
+
+  suite('session history: day labels are plain language', () => {
+    const now = new Date(2026, 8, 27, 12, 0, 0).getTime();
+    const today = new Date(2026, 8, 27, 9, 0, 0).toISOString();
+    const yesterday = new Date(2026, 8, 26, 9, 0, 0).toISOString();
+    const lastWeek = new Date(2026, 8, 20, 9, 0, 0).toISOString();
+
+    check('today reads as Today', dayLabel(today, now) === 'Today', dayLabel(today, now));
+    check('yesterday reads as Yesterday', dayLabel(yesterday, now) === 'Yesterday', dayLabel(yesterday, now));
+    // The exact form follows the device locale ("Sep 20" / "20 Sept" / "20/09"),
+    // so the assertion is that it is a short label naming the day, not Today or
+    // Yesterday, rather than one hardcoded spelling.
+    const older = dayLabel(lastWeek, now);
+    check('an older session gets a plain date label', older !== null && older !== 'Today' && older !== 'Yesterday', older);
+    check('and that label names the day it happened', older !== null && older.includes('20'), older);
+    check('an undatable record has no label', dayLabel('not a date', now) === null);
+  });
+
+  suite('session history UI: the wording stays plain and scores nothing', () => {
+    const nodeRequire = require as unknown as (id: string) => {
+      readFileSync(path: string, encoding: 'utf8'): string;
+      resolve(...segments: string[]): string;
+    };
+    const raw = nodeRequire('fs').readFileSync(
+      nodeRequire('path').resolve(__dirname, '../../src/components/session/session-history.tsx'),
+      'utf8',
+    );
+
+    // Comments are stripped before any wording check. They deliberately spell out
+    // several clinical terms in order to rule them out, so scanning raw source
+    // would flag the explanation as if it were the wording.
+    const code = raw.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/.*$/gm, '$1');
+
+    // Clinical or judgemental vocabulary has no place in a history list. This
+    // scans the whole comment-stripped file, not just string literals, so a
+    // clinical term cannot reappear in a formatted value either.
+    const banned = [
+      'accuracy', 'score', 'health', 'healthy', 'recovery', 'performance',
+      'diagnos', 'patient', 'therapy', 'rehab', 'quality', 'grade', 'level',
+      'calorie', 'target', 'goal', 'improvement', 'symptom', 'clinical',
+    ];
+    for (const word of banned) {
+      check(
+        `the history screen never says "${word}"`,
+        !code.toLowerCase().includes(word),
+        code.match(new RegExp(`.{0,40}${word}.{0,40}`, 'i')),
+      );
+    }
+
+    // The empty state must invite the first session rather than imply a lack.
+    // It also names every kind of session now, because all four land in this one
+    // list — saying "exercise sessions" would be wrong for somebody whose only
+    // session so far has been a yoga routine.
+    check('the empty state says there are none yet', code.includes('No sessions yet'));
+    check('and explains what will fill it', code.includes('Finish an exercise, a yoga routine, or a calm moment'));
+
+    // The count is phrased the same way the Result screen phrases it, so the two
+    // never disagree about the same session.
+    check(
+      'the count is phrased as exercises completed',
+      code.includes('exercise') && code.includes('exercises') && code.includes('completed'),
+    );
+    check('the singular is handled', code.includes("reps === 1 ? 'exercise' : 'exercises'"));
+
+    // A metric the engine could not measure must be hidden, not shown as a zero.
+    check(
+      'an unmeasured pace is hidden rather than shown as zero',
+      code.includes('record.paceRpm !== null'),
+    );
+    check(
+      'an unmeasured day is hidden rather than shown as a blank',
+      code.includes('day !== null'),
+    );
+  });
+
+  suite('session history UI: load failures are visible and retryable', () => {
+    const nodeRequire = require as unknown as (id: string) => {
+      readFileSync(path: string, encoding: 'utf8'): string;
+      resolve(...segments: string[]): string;
+    };
+    const fs = nodeRequire('fs');
+    const paths = nodeRequire('path');
+    const read = (relative: string) =>
+      fs.readFileSync(paths.resolve(__dirname, `../../${relative}`), 'utf8');
+    const history = read('src/components/session/session-history.tsx');
+    const notice = read('src/components/session/session-history-load-notice.tsx');
+    const progressHook = read('src/hooks/use-progress.ts');
+    const progressScreen = read('src/app/(tabs)/progress.tsx');
+    const homeScreen = read('src/app/(tabs)/index.tsx');
+
+    check('the standalone history uses the detailed store result', history.includes('getSessionsResult()'));
+    check('history renders an error instead of its empty state on failed reads',
+      history.includes('if (records === null)') && history.includes('SessionHistoryLoadNotice'));
+    check('the history retry invokes a fresh focus-scoped read',
+      history.includes('retryLoader.current = load') && history.includes('retryLoader.current?.()'));
+    check('the notice uses an alert role and assertive live announcement',
+      notice.includes('accessibilityRole="alert"') && notice.includes('accessibilityLiveRegion="assertive"'));
+    check('the notice provides a retry button', notice.includes('title="Try again"') && notice.includes('onPress={onRetry}'));
+    check('storage and malformed-data failures have distinct wording',
+      notice.includes('could not be loaded from this device') &&
+        notice.includes('stored session history could not be read'));
+    check('Progress uses the detailed shared read and retry handler',
+      progressHook.includes('getSessionsResult()') && progressHook.includes('retry: () => void'));
+    check('Progress displays the shared load issue and supplies one record list to History',
+      progressScreen.includes('<SessionHistoryLoadNotice issue={issue} onRetry={retry} />') &&
+        progressScreen.includes('loadedRecords={records}'));
+    check('Home also makes failed progress reads visible with retry',
+      homeScreen.includes('<SessionHistoryLoadNotice issue={issue} onRetry={retry} />'));
+  });
+}

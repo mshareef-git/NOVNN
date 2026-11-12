@@ -1,0 +1,114 @@
+import type { ReactNode } from 'react';
+import { StyleSheet, Text, View } from 'react-native';
+
+import { Radius, Spacing, Type } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
+
+export type ScoreCardProps = {
+  /** Numeric score out of `max`. Omit to render an empty state. */
+  score?: number;
+  /** Denominator used for the progress bar. Defaults to `100`. */
+  max?: number;
+  label?: string;
+  hint?: string;
+  /** Charcoal card in light mode / keeps warm-white text. */
+  variant?: 'surface' | 'inverse';
+  /** Color used for the number and the progress fill. */
+  emphasis?: 'accent' | 'sage';
+  /** Optional element rendered next to the label. */
+  trailing?: ReactNode;
+};
+
+export function ScoreCard({
+  score,
+  max = 100,
+  label,
+  hint,
+  variant = 'inverse',
+  emphasis = 'sage',
+  trailing,
+}: ScoreCardProps) {
+  const theme = useTheme();
+  const inverse = variant === 'inverse';
+
+  const hasScore = typeof score === 'number';
+  const pct = hasScore ? Math.max(0, Math.min(100, (score / max) * 100)) : 0;
+
+  const cardBackground = inverse ? theme.surfaceInverse : theme.backgroundElement;
+  const numberColor = inverse
+    ? emphasis === 'accent'
+      ? theme.scoreAccentOnInverse
+      : theme.scoreSageOnInverse
+    : theme.accentSecondary;
+  const titleColor = inverse ? theme.onInverse : theme.heading;
+  const secondaryColor = inverse ? theme.onInverseSecondary : theme.textSecondary;
+  const trackColor = inverse ? theme.inverseTrack : theme.backgroundSelected;
+
+  return (
+    <View style={[styles.card, { backgroundColor: cardBackground }]}>
+      <View style={styles.topRow}>
+        <Text style={[styles.score, { color: hasScore ? numberColor : secondaryColor }]}>
+          {hasScore ? score : '—'}
+        </Text>
+        <View style={styles.copy}>
+          {label ? <Text style={[styles.label, { color: titleColor }]}>{label}</Text> : null}
+          {hint ? (
+            <Text style={[styles.hint, { color: secondaryColor }]}>{hint}</Text>
+          ) : null}
+        </View>
+        {trailing}
+      </View>
+
+      <View style={[styles.track, { backgroundColor: trackColor }]}>
+        <View
+          style={[
+            styles.fill,
+            { backgroundColor: numberColor, width: hasScore ? `${pct}%` : '0%' },
+          ]}
+        />
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  card: {
+    padding: Spacing.six,
+    borderRadius: 28,
+    gap: Spacing.five,
+  },
+  topRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.five,
+  },
+  score: {
+    ...Type.headingLarge,
+    fontSize: 44,
+    lineHeight: 48,
+    fontWeight: '800',
+  },
+  copy: {
+    flex: 1,
+    gap: Spacing.half,
+  },
+  label: {
+    ...Type.label,
+    fontSize: 18,
+    lineHeight: 24,
+  },
+  hint: {
+    ...Type.label,
+    fontSize: 16,
+    lineHeight: 22,
+  },
+  track: {
+    height: 8,
+    borderRadius: Radius.pill,
+    overflow: 'hidden',
+  },
+  fill: {
+    height: '100%',
+    borderRadius: Radius.pill,
+  },
+});
