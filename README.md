@@ -8,7 +8,10 @@ npx expo start --web
 npx expo start --go --tunnel
 
 ```
-
+>also to run on phone browswer
+```
+https://oygsqh0-anonymous-8081.exp.direct
+```
 # to compile on pc to phone(connect phone through usb cable)
 ```
 npx expo run:android
