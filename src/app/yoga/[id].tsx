@@ -12,7 +12,7 @@ import { SectionHeader } from '@/components/ui/section-header';
 import { Spacing, Type } from '@/constants/theme';
 import { sessionStore } from '@/exercise/session-storage';
 import { useTheme } from '@/hooks/use-theme';
-import { asanas, findAsana, selectedSeconds, timingOptions, yogaSafety } from '@/yoga/asanas';
+import { asanas, findActiveAsana, selectedSeconds, timingOptions, yogaSafety } from '@/yoga/asanas';
 
 export function generateStaticParams() {
   return [...asanas, ...guidedCatalog('yoga')].map(({ id }) => ({ id }));
@@ -22,7 +22,7 @@ export default function YogaRoutineScreen() {
   const { id, hold, rest } = useLocalSearchParams<{ id?: string; hold?: string; rest?: string }>();
   const router = useRouter();
   const theme = useTheme();
-  const asana = findAsana(id);
+  const asana = findActiveAsana(id);
   if (!asana) {
     const legacy = findGuidedActivityInKind('yoga', id);
     return legacy ? <GuidedActivityScreen activity={legacy} /> : <GuidedNotFound kind="yoga" />;
@@ -34,6 +34,8 @@ export default function YogaRoutineScreen() {
     <Header title={asana.name} subtitle={`${asana.sanskrit} · ${asana.description}`} />
     <Card variant="surface" gap={Spacing.three}>
       <SectionHeader title="How to do it" />
+      {asana.overview && <Text style={body}>{asana.overview}</Text>}
+      {asana.benefits && <Text style={body}>{asana.benefits}</Text>}
       {asana.instructions.map((line, i) => <Text key={line} style={body}>{i + 1}. {line}</Text>)}
     </Card>
     <Card variant="tint" gap={Spacing.three}>

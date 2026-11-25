@@ -69,7 +69,7 @@ export class YogaSession {
       else if (excess > 0) this.advanceCountdown(excess);
     } else if (this.phase === 'preparation' || this.phase === 'resting') {
       this.advanceCountdown(delta);
-    } else if (!this.manual && this.lastValid !== null && now - this.lastValid > GRACE) {
+    } else if (!this.manual && this.lastValid !== null && now - this.lastValid > (this.asana.trackingGraceMs ?? GRACE)) {
       if (this.phase === 'holding') this.interrupt();
       else {
         this.stableSince = null;

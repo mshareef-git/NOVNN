@@ -1,12 +1,12 @@
 import { check, suite } from './harness';
 import type { LandmarkEventPayload, PoseFrameEventPayload, PoseLandmarkName } from '../modules/pose-tracker';
-import { asanas, holdCount } from '../src/yoga/asanas';
+import { asanas, findActiveAsana, findAsana, holdCount } from '../src/yoga/asanas';
 import { observePosture } from '../src/yoga/posture';
 import { completedHolds, isYogaResult, YogaSession } from '../src/yoga/session';
 import { createSessionRecord, createSessionStore, parseSessionRecord } from '../src/exercise/session-store';
 import { describeSessionOutcome } from '../src/activities/activity-format';
 
-const [mountain, bend, twist] = asanas;
+const [mountain, bend, salute] = asanas;
 function pose(points: [PoseLandmarkName, number, number][]): PoseFrameEventPayload {
   const landmarks: LandmarkEventPayload[] = points.map(([name, x, y]) => ({ name, x, y, visibility: 1, z: 0, presence: 1 }));
   return { timestampMs: 0, imageWidth: 800, imageHeight: 800, presence: 'tracked', landmarks };
@@ -30,7 +30,6 @@ export function run() {
         if (mirror) front.landmarks.forEach(p => { p.x = 1 - p.x; });
         check('anatomical ' + side + ' in mirrored=' + mirror, observePosture(bend,side,front) === 'valid');
         check('wrong side rejected', observePosture(bend,side === 'left' ? 'right' : 'left',front) === 'invalid');
-        check('side bend alone cannot start a twist', observePosture(twist,side,front) !== 'valid');
       }
     }
   });
@@ -40,7 +39,7 @@ export function run() {
     // its depth, then project into a widescreen video frame.
     for (const degrees of [-90, -65, 0, 65, 90]) {
       const angle = degrees * Math.PI / 180;
-      for (const asana of asanas) {
+      for (const asana of [mountain, bend]) {
         for (const side of ['left', 'right'] as const) {
           const frame = pose([]);
           frame.imageWidth = 1280;
@@ -49,9 +48,8 @@ export function run() {
           for (const sign of [-1, 1]) {
             const prefix = sign === 1 ? 'LEFT' : 'RIGHT';
             const torsoOffset = asana === bend ? direction * .09 : 0;
-            const twistDepth = asana === twist ? sign * direction * .04 : 0;
             for (const [name, x, y, z] of [
-              ['SHOULDER', sign * .12 + torsoOffset,.3, twistDepth],
+              ['SHOULDER', sign * .12 + torsoOffset,.3, 0],
               ['HIP', sign * .09,.60,0], ['KNEE',sign * .09,.65,-.20],
               ['ANKLE',sign * .09,.9,-.20],
             ] as const) {
@@ -77,42 +75,74 @@ export function run() {
     check('custom duration survives history validation', isYogaResult(s.result(),mountain) && s.result().targetSeconds === 5);
   });
 
-  suite('seated twist: directional camera holds', () => {
-    const frame = pose([['LEFT_SHOULDER',.6,.3],['RIGHT_SHOULDER',.4,.3],
-      ['LEFT_HIP',.58,.6],['RIGHT_HIP',.42,.6],['LEFT_KNEE',.58,.68],['RIGHT_KNEE',.42,.68]]);
-    const [left, , hip, , knee] = frame.landmarks;
-    const session = new YogaSession(twist, 0);
-    let time = 10000;
-    for (let i = 0; i < 6; i++) {
-      const side = session.current.side;
-      left.z = 0;
-      check('neutral torso waits', observePosture(twist,side,frame) === 'invalid');
-      left.z = side === 'left' ? .08 : -.08;
-      check('opposite turn rejected', observePosture(twist,side === 'left' ? 'right' : 'left',frame) === 'invalid');
-      hip.z = left.z * .8;
-      check('turning hips with shoulders rejected', observePosture(twist,side,frame) === 'invalid');
-      hip.z = 0;
-      knee.y = .98;
-      check('extended leg rejected', observePosture(twist,side,frame) === 'invalid');
-      knee.y = .68;
-      left.visibility = .3;
-      check('unclear shoulder cannot trigger timing', observePosture(twist,side,frame) === 'insufficient');
-      left.visibility = 1;
-      frame.landmarks.forEach(p => { p.x = 1 - p.x; });
-      const observation = observePosture(twist,side,frame);
-      check('turn recognized with either preview orientation', observation === 'valid');
-      for (let ms = 0; ms <= 17000; ms += 250) session.observe(time + ms, observation);
-      time += 17000;
-      if (i < 5) {
-        check('rest after automatic twist', session.phase === 'resting');
-        session.tick(time += 15000);
+  suite('upward salute: two visible raised arms within a comfortable range', () => {
+    const raised = () => pose([['LEFT_SHOULDER',.62,.48], ['LEFT_ELBOW',.73,.49], ['LEFT_WRIST',.77,.39],
+      ['RIGHT_SHOULDER',.38,.48], ['RIGHT_ELBOW',.28,.44], ['RIGHT_WRIST',.24,.29]]);
+    const classify = (f: PoseFrameEventPayload) => observePosture(salute,'center',f);
+    const frame = raised();
+    check('asymmetric bent elbows and separated hands', classify(frame) === 'valid');
+    frame.landmarks.forEach(p => { p.x = .75 - p.x * .5; p.y *= .5; });
+    frame.imageWidth = 1280; frame.imageHeight = 960;
+    check('mirrored, smaller upper body in landscape', classify(frame) === 'valid');
+    const overhead = raised();
+    overhead.landmarks[1].y = .36; overhead.landmarks[2].y = .21;
+    check('different arm proportions', classify(overhead) === 'valid');
+    const lowered = raised();
+    lowered.landmarks[1].y = .65; lowered.landmarks[2].y = .79;
+    check('one lowered arm', classify(lowered) === 'invalid');
+    lowered.landmarks[4].y = .65; lowered.landmarks[5].y = .79;
+    check('both lowered', classify(lowered) === 'invalid');
+    lowered.landmarks.pop();
+    check('missing wrist takes precedence over incorrect form', classify(lowered) === 'insufficient');
+    frame.landmarks[2].visibility = .3;
+    check('uncertain wrist', classify(frame) === 'insufficient');
+    check('lost frame', classify({...frame,presence:'lost'}) === 'absent');
+    const tilted = raised();
+    tilted.landmarks.push(...pose([['LEFT_HIP',.88,.7],['RIGHT_HIP',.68,.7]]).landmarks);
+    check('visible tilted torso', classify(tilted) === 'invalid');
+  });
+
+  suite('upward salute: interrupted and manually finished hold', () => {
+    const s = new YogaSession(salute,0);
+    for (let t=10000;t<=13000;t+=250) s.observe(t,'valid');
+    s.observe(13400,'insufficient'); s.observe(14000,'valid');
+    check('one-second dropout tolerated without time credit', s.phase === 'holding' && s.current.autoMs === 1000);
+    s.tick(15001);
+    check('longer gap pauses and preserves time', s.phase === 'waiting' && s.remainingMs === 19000);
+    for (let t=15250;t<=17000;t+=250) s.observe(t,'valid');
+    check('reacquisition needs two seconds', s.phase === 'waiting');
+    s.observe(17250,'valid'); s.observe(17500,'valid');
+    check('recovered hold continues', s.phase === 'holding' && s.current.autoMs === 1250);
+    s.useManual(17500); s.confirm(17500); s.tick(36250); s.end(36250);
+    const h = s.result().holds[0];
+    check('manual completion credits separate sources', h.autoMs === 1250 && h.manualMs === 18750);
+  });
+
+  suite('upward salute: active catalogue and historical results', async () => {
+    const oldId = 'ardha-matsyendrasana';
+    const old = findAsana(oldId)!;
+    check('exactly three selectable poses', asanas.map(p=>p.id).join(',') === 'tadasana,parsva-sukhasana,urdhva-hastasana');
+    check('twist is history only', !findActiveAsana(oldId) && old.id === oldId);
+    let saved: string | null = null;
+    const storage = {getItem: async () => saved, setItem: async (_:string,v:string) => {saved=v;}, removeItem: async () => {saved=null;}};
+    for (const asana of [old,salute]) {
+      const s = new YogaSession(asana,0);
+      let t = 10000;
+      for (let i=0;i<holdCount(asana);i++) {
+        for (let ms=0;ms<=2000+asana.targetSeconds*1000;ms+=250) s.observe(t+ms,'valid');
+        t += 2000+asana.targetSeconds*1000;
+        if (!s.terminal) {t+=15000;s.tick(t);}
       }
+      const yoga = s.result();
+      const record = createSessionRecord({id:asana.id,exerciseId:asana.id,exerciseName:asana.name,activityKind:'yoga',
+        completedAt:new Date(0).toISOString(),yoga,stepsCompleted:holdCount(asana),metrics:{reps:0,durationSeconds:t/1000,
+          paceRpm:null,rangeMinDeg:null,rangeMaxDeg:null,consistencyPct:null}});
+      await createSessionStore(storage).saveSession(record);
+      check('original ID, label and holds survive reload', JSON.stringify((await createSessionStore(storage).getSessionById(asana.id))?.yoga) === JSON.stringify(yoga)
+        && parseSessionRecord(record)?.exerciseName === asana.name);
+      if (asana === salute) check('100 seconds plus three acquisitions', t === 106000 && yoga.holds.length === 3 && yoga.holds.every(h=>h.side==='center'));
     }
-    const result = session.result();
-    check('all six camera holds saved', isYogaResult(result,twist) &&
-      result.holds.every(h => h.autoMs === 15000 && h.manualMs === 0));
-    check('old manual twist results still readable', isYogaResult({...result,
-      holds: result.holds.map(h => ({ ...h, autoMs: 0, manualMs: 15000 }))},twist));
+    check('both historical records coexist', (await createSessionStore(storage).getSessions()).length === 2);
   });
 
   suite('seated yoga: every round and rest interval', () => {

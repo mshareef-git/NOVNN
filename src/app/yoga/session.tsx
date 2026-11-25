@@ -14,7 +14,7 @@ import { Radius, Spacing, Type } from '@/constants/theme';
 import { createSessionId, createSessionRecord } from '@/exercise/session-store';
 import { sessionStore } from '@/exercise/session-storage';
 import { useTheme } from '@/hooks/use-theme';
-import { findAsana, selectedSeconds, yogaSafety, type Asana } from '@/yoga/asanas';
+import { findActiveAsana, selectedSeconds, yogaSafety, type Asana } from '@/yoga/asanas';
 import { observePosture, type Observation } from '@/yoga/posture';
 import { completedHolds, YogaSession } from '@/yoga/session';
 
@@ -36,7 +36,7 @@ export default function YogaSessionRoute() {
   // Static web exports render this route without its query string.
   const mounted = useSyncExternalStore(emptySubscribe, () => true, () => false);
   if (!mounted) return <Screen><Header title="Opening session…" /></Screen>;
-  const asana = findAsana(id);
+  const asana = findActiveAsana(id);
   return asana ? <Session key={asana.id} asana={asana} holdSeconds={selectedSeconds(hold, asana.targetSeconds)} restSeconds={selectedSeconds(rest, 15)} /> : <GuidedNotFound kind="yoga" />;
 }
 
@@ -138,12 +138,12 @@ function Session({ asana, holdSeconds, restSeconds }: { asana: Asana; holdSecond
   </Screen>;
 
   const headline = { preparation: 'Prepare your chair', waiting: view.manual ? 'Confirm your position' : 'Waiting for stable posture',
-    holding: 'Hold comfortably', resting: 'Rest and return to center', paused: 'Session paused',
+    holding: 'Hold comfortably', resting: asana.id === 'urdhva-hastasana' ? 'Slowly lower your arms and relax' : 'Rest and return to center', paused: 'Session paused',
     completed: 'Session complete', cancelled: 'Session ended' }[view.phase];
   const clock = [Math.floor(view.seconds / 60), view.seconds % 60].map(n => String(n).padStart(2, '0')).join(':');
   const label = [Type.label, { color: theme.textSecondary }];
-  const postureCue = asana.id === 'ardha-matsyendrasana' && view.observation === 'invalid'
-    ? `Keep your hips facing forward and gently turn your chest to your ${view.side}.`
+  const postureCue = asana.id === 'urdhva-hastasana' && view.observation === 'invalid'
+    ? 'Raise both arms gently, only as far as comfortable. Keep your shoulders relaxed.'
     : view.observation === 'insufficient' ? asana.cameraHint : statusText[view.observation];
   const timer = (
     <Card gap={Spacing.two} style={desktop && styles.sidebar}>

@@ -3,6 +3,8 @@ import { isTrustedLandmark } from '../exercise/landmark-trust';
 import type { Asana, HoldSide } from './asanas';
 
 export type Observation = 'valid' | 'invalid' | 'insufficient' | 'absent';
+const saluteLimits = { wristRise: 0.12, elbowDrop: 0.16, maxTorsoLean: 35 };
+
 export function observePosture(asana: Asana, side: HoldSide, frame: PoseFrameEventPayload): Observation {
   if (frame.presence !== 'tracked') return 'absent';
   if (asana.manual || !(frame.imageWidth > 0 && frame.imageHeight > 0)) return 'insufficient';
@@ -11,6 +13,26 @@ export function observePosture(asana: Asana, side: HoldSide, frame: PoseFrameEve
     const p = frame.landmarks.find(item => item.name === name);
     return isTrustedLandmark(p, 0.55) && p.x >= 0 && p.x <= 1 && p.y >= 0 && p.y <= 1 ? p : undefined;
   };
+  if (asana.id === 'urdhva-hastasana') {
+    let raised = true;
+    for (const prefix of ['LEFT', 'RIGHT']) {
+      const shoulder = point(prefix + '_SHOULDER'), elbow = point(prefix + '_ELBOW'), wrist = point(prefix + '_WRIST');
+      if (!shoulder || !elbow || !wrist) return 'insufficient';
+      const upper = Math.hypot((shoulder.x - elbow.x) * aspect, shoulder.y - elbow.y);
+      const forearm = Math.hypot((elbow.x - wrist.x) * aspect, elbow.y - wrist.y);
+      if (!upper || !forearm) return 'insufficient';
+      const length = upper + forearm;
+      if (shoulder.y - wrist.y < saluteLimits.wristRise * length ||
+          elbow.y - shoulder.y > saluteLimits.elbowDrop * length) raised = false;
+    }
+    const lh = point('LEFT_HIP'), rh = point('RIGHT_HIP');
+    if (lh && rh) {
+      const l = point('LEFT_SHOULDER')!, r = point('RIGHT_SHOULDER')!;
+      const tilt = Math.atan2(Math.abs(l.x + r.x - lh.x - rh.x) * aspect, lh.y + rh.y - l.y - r.y);
+      if (tilt * 180 / Math.PI > saluteLimits.maxTorsoLean) return 'invalid';
+    }
+    return raised ? 'valid' : 'invalid';
+  }
   if (!asana.bilateral) {
     let visible = false;
     for (const prefix of ['LEFT', 'RIGHT']) {
@@ -48,21 +70,6 @@ export function observePosture(asana: Asana, side: HoldSide, frame: PoseFrameEve
   const offsetZ = (l.z + r.z - lh.z - rh.z) / 2;
   const lateral = (offsetX * hipX + offsetZ * hipZ) * aspect / hipSpan;
   const direction = side === 'left' ? 1 : -1;
-  if (asana.id === 'ardha-matsyendrasana') {
-    const knees = [point('LEFT_KNEE'), point('RIGHT_KNEE')].filter(knee => knee !== undefined);
-    if (!knees.length) return 'insufficient';
-    const hipHeight = (lh.y + rh.y) / 2;
-    if (!knees.every(knee => Math.abs(knee.y - hipHeight) <= 0.65 * height) ||
-        Math.abs(lateral) > 0.30 * height) return 'invalid';
-
-    const dot = hipX * shoulderX + hipZ * shoulderZ;
-    const cross = hipX * shoulderZ - hipZ * shoulderX;
-    // Trackers emit unmirrored image coordinates. Also accept reflected
-    // frontal inputs when the hip span identifies their handedness.
-    const handedness = Math.abs(hipX) > Math.abs(hipZ) ? Math.sign(hipX) : 1;
-    const turn = direction * handedness * Math.atan2(cross, dot) * 180 / Math.PI;
-    return turn >= 12 && turn <= 85 ? 'valid' : 'invalid';
-  }
   const lean = direction * Math.atan2(lateral, height) * 180 / Math.PI;
   return lean >= 7 && lean <= 35 ? 'valid' : 'invalid';
 }
